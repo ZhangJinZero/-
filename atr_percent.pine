@@ -1,0 +1,29 @@
+//@version=6
+indicator("ATR 百分比归一化", shorttitle="ATR%", overlay=false, precision=2)
+
+len    = input.int(14, "ATR 周期", minval=1)
+maType = input.string("RMA", "平滑方式", options=["RMA", "SMA", "EMA"])
+mode   = input.string("ATR / 收盘价 (%)", "归一化方式", options=["ATR / 收盘价 (%)", "历史分位 (0-100)"])
+pctLen = input.int(250, "分位回看(仅分位模式)", minval=20)
+showMa = input.bool(true, "显示均线")
+maLen  = input.int(60, "均线周期", minval=1)
+
+tr_ = ta.tr(true)
+atr = switch maType
+    "SMA" => ta.sma(tr_, len)
+    "EMA" => ta.ema(tr_, len)
+    =>       ta.rma(tr_, len)
+
+atrPct  = atr / close * 100
+atrRank = ta.percentrank(atrPct, pctLen)
+val     = mode == "ATR / 收盘价 (%)" ? atrPct : atrRank
+avg     = ta.sma(val, maLen)
+
+col = val > val[1] ? color.new(#dc2626, 0) : val < val[1] ? color.new(#16a34a, 0) : color.new(#9ca3af, 0)
+plot(val, "ATR%", color=col, linewidth=2, style=plot.style_stepline)
+plot(showMa ? avg : na, "均线", color=color.new(#f59e0b, 30))
+
+isRank = mode == "历史分位 (0-100)"
+hline(80, "高位", color=color.new(#dc2626, 60), linestyle=hline.style_dashed, display=display.none)
+hline(20, "低位", color=color.new(#16a34a, 60), linestyle=hline.style_dashed, display=display.none)
+bgcolor(isRank and val <= 20 ? color.new(#16a34a, 90) : isRank and val >= 80 ? color.new(#dc2626, 90) : na, title="分位极值背景")
