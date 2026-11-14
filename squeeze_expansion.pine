@@ -1,0 +1,278 @@
+//@version=6
+indicator("收敛扩张 · Squeeze → Expansion", shorttitle="收敛扩张", overlay=false, max_boxes_count=300, max_labels_count=500)
+
+// ═════════════════════════════ 输入 ═════════════════════════════
+gS = "① 收敛(状态)"
+sLen    = input.int(5,     "短窗 s",               minval=2,  group=gS)
+lLen    = input.int(60,    "长窗 l",               minval=10, group=gS)
+pctLen  = input.int(250,   "分位回看 W",           minval=50, group=gS)
+sThr    = input.float(0.8, "收敛阈值 S ≥",         minval=0.5, maxval=1.0, step=0.05, group=gS)
+mBars   = input.int(5,     "最少持续根数 m",       minval=1,  group=gS)
+kWidth  = input.float(3.0, "箱体宽度上限 × ATR_l", minval=0.5, step=0.25, group=gS)
+useVolS = input.bool(true, "评分包含量能分量",     group=gS)
+
+gE = "② 扩张(事件)"
+kTR        = input.float(2.0,  "位移倍数:TR ≥ k × σc",       minval=1.0, step=0.1,  group=gE)
+kBreak     = input.float(0.25, "脱离缓冲:超出箱体 k × σc",   minval=0.0, step=0.05, group=gE)
+closeQ     = input.float(0.7,  "收盘质量(收盘在K线中的位置)", minval=0.5, maxval=1.0, step=0.05, group=gE)
+useVolConf = input.bool(false, "要求量能确认",                group=gE)
+kVol       = input.float(1.5,  "量能倍数 × 收敛期均量",       minval=1.0, step=0.1,  group=gE)
+useTrend   = input.bool(false, "只做顺 60 均线方向的突破",    group=gE)
+
+gR = "③ 风险与结束"
+stopMode = input.string("箱体中线", "初始止损", options=["箱体中线", "箱体对侧"], group=gR)
+failBars = input.int(3,     "假突破判定窗口(根)",          minval=1, group=gR)
+useHot   = input.bool(true, "结束:波动过热",               group=gR)
+hotThr   = input.float(0.8, "过热阈值(幅度分位 ≥)",        minval=0.5, maxval=1.0, step=0.05, group=gR)
+kTrail   = input.float(2.0, "结束:回撤 ≥ k × ATR_s",       minval=0.5, step=0.25, group=gR)
+timeStop = input.int(10,    "时间止损:N 根内未达 1R",      minval=1, group=gR)
+
+gV = "④ 显示"
+showComp  = input.bool(false, "副图显示三个分量",   group=gV)
+showStats = input.bool(true,  "主图显示统计表",     group=gV)
+
+// ═════════════════════════════ 基础量 ═════════════════════════════
+tr_  = ta.tr(true)
+atrS = ta.sma(tr_, sLen)
+atrL = ta.sma(tr_, lLen)
+
+ma1  = ta.sma(close, 5)
+ma2  = ta.sma(close, 10)
+ma3  = ta.sma(close, 20)
+ma4  = ta.sma(close, 60)
+maHi = math.max(ma1, ma2, ma3, ma4)
+maLo = math.min(ma1, ma2, ma3, ma4)
+trendUp = ma4 > ma4[5]
+trendDn = ma4 < ma4[5]
+
+volS = ta.sma(volume, sLen)
+volL = ta.sma(volume, lLen)
+
+// 三个分量:相对自身历史的分位(0~1,只用过去数据)
+compA = ta.percentrank(atrS / atrL, pctLen) / 100
+compB = ta.percentrank((maHi - maLo) / atrL, pctLen) / 100
+compV = ta.percentrank(volS / volL, pctLen) / 100
+
+hasVol = useVolS and not na(compV)
+score  = hasVol ? 1 - (compA + compB + compV) / 3 : 1 - (compA + compB) / 2
+strong = not na(score) and score >= sThr
+
+rng      = high - low
+closePos = rng > 0 ? (close - low) / rng : 0.5
+
+// ═════════════════════════════ 配色 ═════════════════════════════
+cSqz    = color.new(#f59e0b, 0)
+cBoxBd  = color.new(#f59e0b, 20)
+cBoxBg  = color.new(#f59e0b, 85)
+cDimBd  = color.new(#9ca3af, 60)
+cDimBg  = color.new(#9ca3af, 93)
+cUp     = color.new(#16a34a, 0)
+cDn     = color.new(#dc2626, 0)
+
+// ═════════════════════════════ 状态变量 ═════════════════════════════
+// 收敛箱体(连续 strong 的区间)
+var int   runLen   = 0
+var int   boxStart = na
+var float boxHi    = na
+var float boxLo    = na
+var float sumTR    = 0.0
+var float sumVol   = 0.0
+var bool  sqzPrev  = false
+var box   bx       = na
+
+// 扩张状态
+var int   dir     = 0
+var float entry   = na
+var float stop    = na
+var float r0      = na
+var int   trigBar = na
+var float trigU   = na
+var float trigLo  = na
+var float peak    = na
+var float mfe     = 0.0
+// 触发后的累计,用于假突破后并回箱体
+var float extHi   = na
+var float extLo   = na
+var float extTR   = 0.0
+var float extVol  = 0.0
+var int   extN    = 0
+
+// 统计
+var int   nTrig = 0
+var int   nDone = 0
+var int   nFail = 0
+var float sumR  = 0.0
+
+bool trigUp  = false
+bool trigDn  = false
+bool resumed = false
+int  dirOpen = dir
+
+// ═════════════════════════════ A. 管理已有的扩张 ═════════════════════════════
+if dirOpen != 0
+    n = bar_index - trigBar
+    extHi  := math.max(extHi, high)
+    extLo  := math.min(extLo, low)
+    extTR  += tr_
+    extVol += nz(volume)
+    extN   += 1
+    peak   := dir == 1 ? math.max(peak, close) : math.min(peak, close)
+    mfe    := math.max(mfe, dir == 1 ? high - entry : entry - low)
+
+    backInside = dir == 1 ? close < trigU : close > trigLo
+    stopHit    = dir == 1 ? low <= stop : high >= stop
+    giveBack   = dir == 1 ? peak - close : close - peak
+
+    string reason = na
+    if n <= failBars and backInside
+        reason := "假"
+    else if stopHit
+        reason := "损"
+    else if useHot and compA >= hotThr
+        reason := "热"
+    else if giveBack >= kTrail * atrS
+        reason := "撤"
+    else if n == timeStop and mfe < r0
+        reason := "时"
+
+    if not na(reason)
+        exitPx = stopHit ? stop : close
+        rMult  = dir * (exitPx - entry) / r0
+        nDone += 1
+        sumR  += rMult
+        if reason == "假"
+            nFail += 1
+        label.new(bar_index, dir == 1 ? high : low,
+             text      = reason + " " + (rMult > 0 ? "+" : "") + str.tostring(rMult, "0.0") + "R",
+             style     = dir == 1 ? label.style_label_down : label.style_label_up,
+             color     = rMult > 0 ? cUp : cDn,
+             textcolor = color.white,
+             size      = size.small,
+             force_overlay = true)
+
+        // 假突破且仍处于收敛:把触发以来的K线并回箱体,继续等待
+        if reason == "假" and strong
+            boxHi  := math.max(boxHi, extHi)
+            boxLo  := math.min(boxLo, extLo)
+            sumTR  += extTR
+            sumVol += extVol
+            runLen += extN
+            resumed := true
+            box.set_bgcolor(bx, cBoxBg)
+            box.set_border_color(bx, cBoxBd)
+        else
+            runLen := 0
+            bx     := na
+        dir := 0
+
+// ═════════════════════════════ B. 扩张触发 ═════════════════════════════
+if dirOpen == 0 and sqzPrev
+    sigC    = sumTR / runLen
+    avgVolC = sumVol / runLen
+    volOk   = not useVolConf or volume >= kVol * avgVolC
+    bigMove = tr_ >= kTR * sigC
+    up = bigMove and close > boxHi + kBreak * sigC and closePos >= closeQ     and volOk and (not useTrend or trendUp)
+    dn = bigMove and close < boxLo - kBreak * sigC and closePos <= 1 - closeQ and volOk and (not useTrend or trendDn)
+    if up or dn
+        dir     := up ? 1 : -1
+        trigUp  := up
+        trigDn  := dn
+        entry   := close
+        trigU   := boxHi
+        trigLo  := boxLo
+        stop    := stopMode == "箱体中线" ? (boxHi + boxLo) / 2 : (up ? boxLo : boxHi)
+        r0      := math.abs(entry - stop)
+        trigBar := bar_index
+        peak    := close
+        mfe     := 0.0
+        extHi   := high
+        extLo   := low
+        extTR   := tr_
+        extVol  := nz(volume)
+        extN    := 1
+        nTrig   += 1
+        box.set_right(bx, bar_index)
+        box.set_border_color(bx, up ? cUp : cDn)
+        box.set_bgcolor(bx, color.new(up ? cUp : cDn, 85))
+
+// ═════════════════════════════ C. 箱体跟踪 ═════════════════════════════
+if dir == 0
+    if not resumed
+        if strong
+            if runLen == 0
+                runLen   := 1
+                boxStart := bar_index
+                boxHi    := high
+                boxLo    := low
+                sumTR    := tr_
+                sumVol   := nz(volume)
+            else
+                runLen += 1
+                boxHi  := math.max(boxHi, high)
+                boxLo  := math.min(boxLo, low)
+                sumTR  += tr_
+                sumVol += nz(volume)
+        else
+            // 收敛自然消散,没有触发:箱体置灰
+            box.set_border_color(bx, cDimBd)
+            box.set_bgcolor(bx, cDimBg)
+            runLen := 0
+            bx     := na
+    // 无漂移条件:箱体过宽则作废,从当根重新开始
+    if runLen > 0 and boxHi - boxLo > kWidth * atrL
+        box.set_border_color(bx, cDimBd)
+        box.set_bgcolor(bx, cDimBg)
+        bx       := na
+        runLen   := 1
+        boxStart := bar_index
+        boxHi    := high
+        boxLo    := low
+        sumTR    := tr_
+        sumVol   := nz(volume)
+
+// ═════════════════════════════ D. 收敛状态 ═════════════════════════════
+sqz = dir == 0 and strong and runLen >= mBars
+if sqz
+    if na(bx)
+        bx := box.new(left=boxStart, top=boxHi, right=bar_index, bottom=boxLo,
+             border_color=cBoxBd, border_width=1, bgcolor=cBoxBg, force_overlay=true)
+    else
+        box.set_top(bx, boxHi)
+        box.set_bottom(bx, boxLo)
+        box.set_right(bx, bar_index)
+sqzPrev := sqz
+
+// ═════════════════════════════ 副图:收敛度评分 ═════════════════════════════
+plot(score, "收敛度 S", style=plot.style_columns,
+     color = sqz ? cSqz : strong ? color.new(#f59e0b, 55) : color.new(#9ca3af, 60))
+hline(sThr, "收敛阈值", color=color.new(#f59e0b, 30), linestyle=hline.style_dashed)
+plot(showComp ? 1 - compA : na, "1 − 幅度分位", color=color.new(#3b82f6, 0))
+plot(showComp ? 1 - compB : na, "1 − 结构分位", color=color.new(#a855f7, 0))
+plot(showComp and hasVol ? 1 - compV : na, "1 − 量能分位", color=color.new(#14b8a6, 0))
+
+// ═════════════════════════════ 主图:扩张 ═════════════════════════════
+bgDir = dir != 0 ? dir : dirOpen
+bgcolor(bgDir == 1 ? color.new(cUp, 90) : bgDir == -1 ? color.new(cDn, 90) : na, title="扩张状态", force_overlay=true)
+
+plotshape(trigUp, "向上扩张", style=shape.triangleup,   location=location.belowbar, color=cUp, size=size.small, force_overlay=true)
+plotshape(trigDn, "向下扩张", style=shape.triangledown, location=location.abovebar, color=cDn, size=size.small, force_overlay=true)
+
+plot(dir != 0 ? stop  : na, "止损", color=color.new(cDn, 20),      style=plot.style_linebr, force_overlay=true)
+plot(dir != 0 ? entry : na, "入场", color=color.new(#6b7280, 30),  style=plot.style_linebr, force_overlay=true)
+
+// ═════════════════════════════ 统计表 ═════════════════════════════
+var table tb = table.new(position.top_right, 2, 4, bgcolor=color.new(#111827, 15), border_width=1, force_overlay=true)
+if showStats and barstate.islast
+    table.cell(tb, 0, 0, "触发次数",  text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 0, str.tostring(nTrig), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 1, "假突破率",  text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 1, nDone > 0 ? str.tostring(100.0 * nFail / nDone, "0") + "%" : "—", text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 2, "平均 R",    text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 2, nDone > 0 ? str.tostring(sumR / nDone, "0.00") : "—", text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 3, "累计 R",    text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 3, str.tostring(sumR, "0.0"), text_color=color.white, text_size=size.small)
+
+// ═════════════════════════════ 警报 ═════════════════════════════
+alertcondition(trigUp, "向上扩张", "收敛后向上扩张触发")
+alertcondition(trigDn, "向下扩张", "收敛后向下扩张触发")
+alertcondition(sqz and not sqz[1], "进入收敛", "收敛状态成立")
